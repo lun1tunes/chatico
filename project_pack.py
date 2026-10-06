@@ -11,9 +11,11 @@ paste them back together; unpack with the same --key.
 Profiles (file selection only; the seal is the same):
   mas   this repo's deployment tree, split -ch → ~/chatico/o_allN
   pywp  the pywp runtime tree, split -ch → ~/chatico/p_allN
+  repo  any other project tree, split -ch → ~/chatico/{dirname}_allN
 Auto-detected from the project root, or pass --profile.
 One file: -f PATH pack split → {name}_all.txt and {name}_all1, {name}_all2, …
 With -ch those land in ~/chatico under the file name, not o_all/p_all.
+A repo pack skips paths matched by .packignore (gitignore-style, including nested files). -f does not.
 """
 from __future__ import annotations
 
@@ -48,6 +50,26 @@ _HEADER_KEYS = ("kdf", "n", "r", "p", "salt", "nonce", "mac")
 PROFILE: str | None = None
 # split -ch writes these names into ~/chatico so both projects share one git repo.
 CHUNK_TAGS = {"mas": "o", "pywp": "p"}
+
+# --- repo (generic) ----------------------------------------------------
+
+_REPO_EXCLUDED_DIRS = {
+    ".git", ".github", ".idea", ".mypy_cache", ".nox", ".pytest_cache",
+    ".ruff_cache", ".tox", ".uv-cache", ".venv", ".vscode", ".windsurf",
+    "__pycache__", "node_modules", "venv",
+}
+_REPO_EXTENSIONS = {
+    ".bat", ".cfg", ".css", ".csv", ".example", ".gif", ".html", ".inc",
+    ".ini", ".js", ".json", ".jpg", ".jpeg", ".lock", ".md", ".mp4", ".otf",
+    ".png", ".py", ".sh", ".svg", ".toml", ".ts", ".ttf", ".txt", ".webm",
+    ".webp", ".woff", ".woff2", ".yaml", ".yml",
+}
+_REPO_NAMES = {
+    ".dockerignore", ".env.example", ".gitattributes", ".gitignore",
+    "Dockerfile", "Procfile", "README.md", "constraints.txt", "install.bat",
+    "package-lock.json", "package.json", "requirements-dev.txt",
+    "requirements.txt", "run.bat", "runtime.txt",
+}
 
 # --- mas ---------------------------------------------------------------
 
@@ -107,8 +129,8 @@ def resolve_profile(root: Path, profile: str | None = None) -> str:
         elif (root / "pywp").is_dir():
             chosen = "pywp"
         else:
-            raise ValueError("Cannot detect project profile; pass --profile mas or --profile pywp")
-    if chosen not in {"mas", "pywp"}:
+            chosen = "repo"
+    if chosen not in {"mas", "pywp", "repo"}:
         raise ValueError(f"Unknown profile: {chosen}")
     return chosen
 
@@ -235,11 +257,163 @@ def _collect_pywp(root: Path, *, archive_path: Path | None) -> list[Path]:
     return sorted(set(files), key=lambda item: item.relative_to(root).as_posix())
 
 
+def _repo_skip(path: Path, root: Path) -> bool:
+    relative = path.relative_to(root)
+    if set(relative.parts) & _REPO_EXCLUDED_DIRS:
+        return True
+    if path.suffix == ".env" and not path.name.endswith(".env.example"):
+        return True
+    return path.is_symlink()
+
+
+def _repo_include(path: Path) -> bool:
+    if path.name in _REPO_NAMES or path.name.endswith(".env.example"):
+        return True
+    if path.name.startswith("Dockerfile"):
+        return True
+    return path.suffix.lower() in _REPO_EXTENSIONS
+
+
+def _collect_repo(root: Path, *, archive_path: Path | None) -> list[Path]:
+    archive_resolved = archive_path.resolve() if archive_path is not None else None
+    default_archive_resolved = (root / ARCHIVE_FILE).resolve()
+    files: list[Path] = []
+    for path in root.rglob("*"):
+        if not path.is_file():
+            continue
+        if _repo_skip(path, root) or not _repo_include(path):
+            continue
+        resolved = path.resolve()
+        if resolved == default_archive_resolved or resolved == archive_resolved:
+            continue
+        files.append(path)
+    return sorted(set(files), key=lambda item: item.relative_to(root).as_posix())
+
+
+class _PackRule:
+    def __init__(self, neg: bool, directory: bool, regex: re.Pattern[str]) -> None:
+        self.neg = neg
+        self.directory = directory
+        self.regex = regex
+
+    def matches(self, local: str, is_dir: bool) -> bool:
+        if self.regex.fullmatch(local):
+            return (not self.directory) or is_dir
+        parent = local
+        while "/" in parent:
+            parent = parent.rsplit("/", 1)[0]
+            if self.regex.fullmatch(parent):
+                return True
+        return False
+
+
+def _glob_body(pattern: str) -> str:
+    index = 0
+    parts: list[str] = []
+    while index < len(pattern):
+        if pattern.startswith("**/", index):
+            parts.append("(?:.*/)?")
+            index += 3
+            continue
+        if pattern.startswith("**", index):
+            parts.append(".*")
+            index += 2
+            continue
+        char = pattern[index]
+        if char == "*":
+            parts.append("[^/]*")
+        elif char == "?":
+            parts.append("[^/]")
+        elif char == "[":
+            end = pattern.find("]", index + 1)
+            if end < 0:
+                parts.append(re.escape(char))
+            else:
+                body = pattern[index + 1:end]
+                if body.startswith("!") or body.startswith("^"):
+                    parts.append(f"[^{re.escape(body[1:])}]")
+                else:
+                    parts.append(f"[{re.escape(body)}]")
+                index = end
+        else:
+            parts.append(re.escape(char))
+        index += 1
+    return "".join(parts)
+
+
+def _compile_pack_pattern(pattern: str) -> re.Pattern[str]:
+    if pattern.startswith("/"):
+        pattern = pattern[1:]
+        anchored = True
+    else:
+        anchored = "/" in pattern
+    body = _glob_body(pattern)
+    return re.compile(body if anchored else f"(?:.+/)?{body}")
+
+
+def _parse_packignore(text: str) -> list[_PackRule]:
+    rules: list[_PackRule] = []
+    for raw in text.splitlines():
+        line = raw.strip()
+        if not line or line.startswith("#"):
+            continue
+        neg = line.startswith("!")
+        if neg:
+            line = line[1:].strip()
+        if not line:
+            continue
+        directory = line.endswith("/")
+        if directory:
+            line = line[:-1]
+        if not line:
+            continue
+        rules.append(_PackRule(neg, directory, _compile_pack_pattern(line)))
+    return rules
+
+
+def _packignore_blocks(root: Path) -> list[tuple[Path, list[_PackRule]]]:
+    blocks: list[tuple[Path, list[_PackRule]]] = []
+    for dirpath, dirnames, filenames in os.walk(root):
+        dirnames[:] = [name for name in dirnames if name != ".git"]
+        if ".packignore" not in filenames:
+            continue
+        path = Path(dirpath) / ".packignore"
+        rules = _parse_packignore(path.read_text(encoding="utf-8"))
+        if rules:
+            blocks.append((Path(dirpath), rules))
+    return blocks
+
+
+def _packignored(path: Path, blocks: list[tuple[Path, list[_PackRule]]]) -> bool:
+    ignored = False
+    applicable: list[tuple[int, str, list[_PackRule]]] = []
+    for base, rules in blocks:
+        try:
+            local = path.relative_to(base).as_posix()
+        except ValueError:
+            continue
+        applicable.append((len(base.parts), local, rules))
+    applicable.sort(key=lambda item: item[0])
+    is_dir = path.is_dir()
+    for _, local, rules in applicable:
+        for rule in rules:
+            if rule.matches(local, is_dir):
+                ignored = not rule.neg
+    return ignored
+
+
 def collect_files(root: Path, *, archive_path: Path | None = None, profile: str | None = None) -> list[Path]:
     name = resolve_profile(root, profile)
     if name == "mas":
-        return _collect_mas(root, archive_path=archive_path)
-    return _collect_pywp(root, archive_path=archive_path)
+        files = _collect_mas(root, archive_path=archive_path)
+    elif name == "pywp":
+        files = _collect_pywp(root, archive_path=archive_path)
+    else:
+        files = _collect_repo(root, archive_path=archive_path)
+    blocks = _packignore_blocks(root)
+    if not blocks:
+        return files
+    return [path for path in files if not _packignored(path, blocks)]
 
 
 def _validate_rel(rel: str) -> None:
@@ -501,12 +675,14 @@ def chatico_dir() -> Path:
     return Path.home() / "chatico"
 
 
-def chatico_prefix(profile: str) -> str:
-    try:
-        tag = CHUNK_TAGS[profile]
-    except KeyError as exc:
-        raise ValueError(f"Unknown profile: {profile}") from exc
-    return f"{tag}_all"
+def chatico_prefix(profile: str, root: Path | None = None) -> str:
+    if profile in CHUNK_TAGS:
+        return f"{CHUNK_TAGS[profile]}_all"
+    if profile == "repo":
+        name = (root.name if root is not None else "repo")
+        tag = re.sub(r"[^A-Za-z0-9._-]+", "_", name).strip("._-") or "repo"
+        return f"{tag}_all"
+    raise ValueError(f"Unknown profile: {profile}")
 
 
 def _chunk_pattern(prefix: str) -> re.Pattern[str]:
@@ -622,10 +798,10 @@ def _parse_args() -> argparse.Namespace:
     parser.add_argument(
         "-ch",
         action="store_true",
-        help="split/join chunks in ~/chatico as o_allN (mas) or p_allN (pywp)",
+        help="split/join chunks in ~/chatico as o_allN / p_allN / {dirname}_allN",
     )
     parser.add_argument("--key", default=None, help="Password. Required for pack, unpack, and verify.")
-    parser.add_argument("--profile", choices=("mas", "pywp"), default=None)
+    parser.add_argument("--profile", choices=("mas", "pywp", "repo"), default=None)
     return parser.parse_args()
 
 
@@ -670,7 +846,7 @@ def main() -> None:
     if chunk_prefix is None and one_prefix is not None:
         chunk_prefix = one_prefix
     elif args.ch and chunk_prefix is None:
-        chunk_prefix = chatico_prefix(resolve_profile(root, args.profile))
+        chunk_prefix = chatico_prefix(resolve_profile(root, args.profile), root)
     if ({"pack", "unpack", "verify"} & set(modes)) and not args.key:
         raise SystemExit("error: --key is required for pack, unpack, and verify")
     for mode in modes:
