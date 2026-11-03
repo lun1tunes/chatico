@@ -115,6 +115,8 @@ _PYWP_EXTENSIONS = {".cfg", ".css", ".html", ".inc", ".ini", ".js", ".json", ".p
 _PYWP_NAMES = {
     "Dockerfile", "Procfile", "README.md", "constraints.txt", "requirements.txt",
     "runtime.txt", ".env.example",
+    # brand assets (not in _PYWP_EXTENSIONS; needed for sidebar logo + docs font)
+    "novatek.png", "manrope.ttf",
 }
 
 
