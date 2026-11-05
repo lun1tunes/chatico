@@ -10,12 +10,12 @@ paste them back together; unpack with the same --key.
 
 Profiles (file selection only; the seal is the same):
   mas   this repo's deployment tree, split -ch → ~/chatico/o_allN
-  pywp  the pywp runtime tree, split -ch → ~/chatico/p_allN
+  pywp  same file rules as repo + root .packignore, split -ch → ~/chatico/p_allN
   repo  any other project tree, split -ch → ~/chatico/{dirname}_allN
 Auto-detected from the project root, or pass --profile.
 One file: -f PATH pack split → {name}_all.txt and {name}_all1, {name}_all2, …
 With -ch those land in ~/chatico under the file name, not o_all/p_all.
-A repo pack skips paths matched by .packignore (gitignore-style, including nested files). -f does not.
+repo/pywp packs skip paths matched by .packignore (gitignore-style). -f does not.
 """
 from __future__ import annotations
 
@@ -102,22 +102,7 @@ _MAS_NAMES = {
     "requirements.txt", "requirements-dev.txt",
 }
 
-# --- pywp --------------------------------------------------------------
-
-_PYWP_EXCLUDED_DIRS = {
-    ".git", ".github", ".idea", ".mypy_cache", ".nox", ".pytest_cache",
-    ".ruff_cache", ".tox", ".uv-cache", ".venv", ".vscode", ".windsurf",
-    "__pycache__", "pywp.egg-info", "test_data", "tests", "venv",
-}
-_PYWP_EXCLUDED_PATHS = {"poetry.lock", "pyproject.toml", "pytest.ini", "uv.lock"}
-_PYWP_EXCLUDED_FILES = {"conftest.py", "poetry.lock", "requirements-dev.txt"}
-_PYWP_EXTENSIONS = {".cfg", ".css", ".html", ".inc", ".ini", ".js", ".json", ".py", ".toml", ".yaml", ".yml"}
-_PYWP_NAMES = {
-    "Dockerfile", "Procfile", "README.md", "constraints.txt", "requirements.txt",
-    "runtime.txt", ".env.example",
-    # brand assets (not in _PYWP_EXTENSIONS; needed for sidebar logo + docs font)
-    "novatek.png", "manrope.ttf",
-}
+# pywp: same collect as repo; only CHUNK_TAGS / auto-detect differ.
 
 
 def resolve_profile(root: Path, profile: str | None = None) -> str:
@@ -220,43 +205,6 @@ def _collect_mas(root: Path, *, archive_path: Path | None) -> list[Path]:
             continue
         files.append(path)
     return sorted({p.resolve(): p for p in files}.values(), key=lambda p: p.relative_to(root).as_posix())
-
-
-def _pywp_skip(path: Path, root: Path) -> bool:
-    relative = path.relative_to(root)
-    if set(relative.parts) & _PYWP_EXCLUDED_DIRS:
-        return True
-    if relative.as_posix() in _PYWP_EXCLUDED_PATHS:
-        return True
-    if path.name in _PYWP_EXCLUDED_FILES or "poetry" in path.name.lower():
-        return True
-    if path.name.startswith("test_") and path.suffix.lower() == ".py":
-        return True
-    if path.name.endswith("_test.py"):
-        return True
-    return path.is_symlink()
-
-
-def _pywp_include(path: Path) -> bool:
-    if path.name in _PYWP_NAMES or path.name.startswith("Dockerfile"):
-        return True
-    return path.suffix.lower() in _PYWP_EXTENSIONS
-
-
-def _collect_pywp(root: Path, *, archive_path: Path | None) -> list[Path]:
-    archive_resolved = archive_path.resolve() if archive_path is not None else None
-    default_archive_resolved = (root / ARCHIVE_FILE).resolve()
-    files: list[Path] = []
-    for path in root.rglob("*"):
-        if not path.is_file():
-            continue
-        if _pywp_skip(path, root) or not _pywp_include(path):
-            continue
-        resolved = path.resolve()
-        if resolved == default_archive_resolved or resolved == archive_resolved:
-            continue
-        files.append(path)
-    return sorted(set(files), key=lambda item: item.relative_to(root).as_posix())
 
 
 def _repo_skip(path: Path, root: Path) -> bool:
@@ -408,9 +356,8 @@ def collect_files(root: Path, *, archive_path: Path | None = None, profile: str 
     name = resolve_profile(root, profile)
     if name == "mas":
         files = _collect_mas(root, archive_path=archive_path)
-    elif name == "pywp":
-        files = _collect_pywp(root, archive_path=archive_path)
     else:
+        # pywp and repo: broad tree; project .packignore is the allow/deny list
         files = _collect_repo(root, archive_path=archive_path)
     blocks = _packignore_blocks(root)
     if not blocks:
